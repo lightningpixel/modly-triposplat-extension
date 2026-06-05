@@ -5,7 +5,7 @@
   "source": "https://github.com/lightningpixel/modly-triposplat-extension",
   "description": "Single image to 3D via feed-forward Gaussian Splatting (up to 262k Gaussians). The Generate node reconstructs a vertex-colored mesh; the Texture node smooths it and bakes the color into a UV texture atlas. By Tripo AI / VAST AI Research. Requires ~10GB VRAM.",
   "version": "2.0.0",
-  "author": "Lightning Pixel",
+  "author": "Lorchie",
   "generator_class": "TripoSplatGenerator",
   "vram_gb": 10,
   "tags": ["image-to-3d", "gaussian-splatting", "fast"],
