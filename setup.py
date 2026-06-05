@@ -112,7 +112,13 @@ def setup(
     # Core dependencies
     #   - model runtime: numpy / safetensors / pillow / tqdm
     #   - weight download: huggingface_hub
-    #   - Gaussian -> mesh: open3d (Poisson reconstruction) + trimesh (GLB export)
+    #   - Gaussian -> mesh: pymeshlab (screened Poisson reconstruction) +
+    #     scipy (nearest-neighbour colour transfer) + trimesh (GLB export)
+    #
+    # Note: open3d is intentionally avoided — on Windows its jupyter/dash
+    # dependency tree trips the 260-char MAX_PATH limit during install, and it
+    # hard-imports plotly at module load. pymeshlab is a single self-contained
+    # wheel (already used elsewhere in Modly) with no such baggage.
     # ------------------------------------------------------------------ #
     print("[setup] Installing core dependencies …")
     pip(venv, "install",
@@ -122,7 +128,8 @@ def setup(
         "tqdm",
         "huggingface_hub",
         "trimesh",
-        "open3d",
+        "pymeshlab",
+        "scipy",
     )
 
     # ------------------------------------------------------------------ #

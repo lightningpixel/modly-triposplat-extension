@@ -13,7 +13,7 @@ extension **reconstructs the Gaussians into a watertight, vertex-colored `.glb`*
 
 ```
 image → BiRefNet (bg removal) → DINOv3 → flow sampling → Gaussian decode
-      → colored point cloud → screened Poisson (Open3D) → .glb mesh
+      → colored point cloud → screened Poisson (pymeshlab) → .glb mesh
 ```
 
 The mesh keeps the Gaussians' color (SH DC → vertex colors carried through Poisson).
@@ -33,8 +33,8 @@ The mesh keeps the Gaussians' color (SH DC → vertex colors carried through Poi
 
 Pure PyTorch — **no compiled CUDA extensions**. `setup.py` creates an isolated
 venv with an accelerator-matched PyTorch build, plus `numpy safetensors pillow
-tqdm huggingface_hub trimesh open3d`. The model code (`triposplat.py`, `model.py`)
-is pure Python and bundled in `vendor/`.
+tqdm huggingface_hub trimesh pymeshlab scipy`. The model code (`triposplat.py`,
+`model.py`) is pure Python and bundled in `vendor/`.
 
 - **Weights:** `VAST-AI/TripoSplat` (~3.8 GB), auto-downloaded on first run.
 - **VRAM:** ~10 GB recommended.
