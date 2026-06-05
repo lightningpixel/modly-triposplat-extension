@@ -2,22 +2,76 @@
   "id": "triposplat",
   "name": "TripoSplat",
   "type": "model",
-  "source": "https://github.com/VAST-AI-Research/TripoSplat",
-  "description": "Converts a single 2D image into a high-quality 3D Gaussian representation (up to 262k Gaussians). Feed-forward and fast. Developed by Tripo AI / VAST AI Research.",
+  "source": "https://github.com/lightningpixel/modly-triposplat-extension",
+  "description": "Single image to 3D via feed-forward Gaussian Splatting (up to 262k Gaussians). The Gaussians are reconstructed into a watertight, vertex-colored .glb mesh so they preview and export like any other Modly model. Fast, no diffusion-step blowup. By Tripo AI / VAST AI Research. Requires ~10GB VRAM.",
   "version": "1.0.0",
-  "author": "VAST AI Research",
+  "author": "Lightning Pixel",
   "generator_class": "TripoSplatGenerator",
+  "vram_gb": 10,
   "tags": ["image-to-3d", "gaussian-splatting", "fast"],
   "nodes": [
     {
       "id": "generate",
-      "name": "Generate Splat",
+      "name": "TripoSplat",
       "input": "image",
       "output": "mesh",
       "hf_repo": "VAST-AI/TripoSplat",
-      "download_check": "diffusion_models",
+      "download_check": "diffusion_models/triposplat_fp16.safetensors",
       "hf_skip_prefixes": [],
       "params_schema": [
+        {
+          "id": "steps",
+          "label": "Sampling Steps",
+          "type": "int",
+          "default": 20,
+          "min": 4,
+          "max": 50,
+          "tooltip": "Number of diffusion sampling steps. More steps = cleaner Gaussians but slower."
+        },
+        {
+          "id": "guidance_scale",
+          "label": "CFG Scale",
+          "type": "float",
+          "default": 3.0,
+          "min": 0.0,
+          "max": 10.0,
+          "step": 0.5,
+          "tooltip": "Classifier-free guidance strength. Higher = closer to the input image."
+        },
+        {
+          "id": "num_gaussians",
+          "label": "Gaussians",
+          "type": "select",
+          "default": 262144,
+          "options": [
+            { "value": 65536,  "label": "65k (fast)" },
+            { "value": 131072, "label": "131k" },
+            { "value": 262144, "label": "262k (best)" }
+          ],
+          "tooltip": "Number of Gaussians to decode. More = denser point cloud and finer mesh detail."
+        },
+        {
+          "id": "mesh_detail",
+          "label": "Mesh Detail",
+          "type": "select",
+          "default": 9,
+          "options": [
+            { "value": 7,  "label": "Low (7)" },
+            { "value": 8,  "label": "Medium (8)" },
+            { "value": 9,  "label": "High (9)" },
+            { "value": 10, "label": "Ultra (10)" }
+          ],
+          "tooltip": "Poisson reconstruction depth used to turn the Gaussians into a mesh. Higher = sharper geometry but slower and more triangles."
+        },
+        {
+          "id": "faces",
+          "label": "Max Faces",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 1000000,
+          "tooltip": "Target face count for mesh simplification after reconstruction. -1 to disable."
+        },
         {
           "id": "seed",
           "label": "Seed",
