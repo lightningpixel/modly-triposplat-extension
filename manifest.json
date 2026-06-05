@@ -1,0 +1,33 @@
+{
+  "id": "triposplat",
+  "name": "TripoSplat",
+  "type": "model",
+  "source": "https://github.com/VAST-AI-Research/TripoSplat",
+  "description": "Converts a single 2D image into a high-quality 3D Gaussian representation (up to 262k Gaussians). Feed-forward and fast. Developed by Tripo AI / VAST AI Research.",
+  "version": "1.0.0",
+  "author": "VAST AI Research",
+  "generator_class": "TripoSplatGenerator",
+  "tags": ["image-to-3d", "gaussian-splatting", "fast"],
+  "nodes": [
+    {
+      "id": "generate",
+      "name": "Generate Splat",
+      "input": "image",
+      "output": "mesh",
+      "hf_repo": "VAST-AI/TripoSplat",
+      "download_check": "diffusion_models",
+      "hf_skip_prefixes": [],
+      "params_schema": [
+        {
+          "id": "seed",
+          "label": "Seed",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 4294967295,
+          "tooltip": "Seed for reproducibility. Set to -1 for a random seed."
+        }
+      ]
+    }
+  ]
+}
