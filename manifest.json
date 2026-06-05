@@ -2,22 +2,86 @@
   "id": "triposplat",
   "name": "TripoSplat",
   "type": "model",
-  "source": "https://github.com/VAST-AI-Research/TripoSplat",
-  "description": "Converts a single 2D image into a high-quality 3D Gaussian representation (up to 262k Gaussians). Feed-forward and fast. Developed by Tripo AI / VAST AI Research.",
-  "version": "1.0.0",
-  "author": "VAST AI Research",
+  "source": "https://github.com/lightningpixel/modly-triposplat-extension",
+  "description": "Single image to 3D via feed-forward Gaussian Splatting (up to 262k Gaussians). The Generate node reconstructs a vertex-colored mesh; the Texture node smooths it and bakes the color into a UV texture atlas. By Tripo AI / VAST AI Research. Requires ~10GB VRAM.",
+  "version": "2.0.0",
+  "author": "Lorchie",
   "generator_class": "TripoSplatGenerator",
+  "vram_gb": 10,
   "tags": ["image-to-3d", "gaussian-splatting", "fast"],
   "nodes": [
     {
       "id": "generate",
-      "name": "Generate Splat",
+      "name": "TripoSplat",
       "input": "image",
       "output": "mesh",
       "hf_repo": "VAST-AI/TripoSplat",
-      "download_check": "diffusion_models",
+      "download_check": "diffusion_models/triposplat_fp16.safetensors",
       "hf_skip_prefixes": [],
       "params_schema": [
+        {
+          "id": "steps",
+          "label": "Sampling Steps",
+          "type": "int",
+          "default": 20,
+          "min": 4,
+          "max": 50,
+          "tooltip": "Number of diffusion sampling steps. More steps = cleaner Gaussians but slower."
+        },
+        {
+          "id": "guidance_scale",
+          "label": "CFG Scale",
+          "type": "float",
+          "default": 3.0,
+          "min": 0.0,
+          "max": 10.0,
+          "step": 0.5,
+          "tooltip": "Classifier-free guidance strength. Higher = closer to the input image."
+        },
+        {
+          "id": "shift",
+          "label": "Detail / Shape (Shift)",
+          "type": "float",
+          "default": 3.0,
+          "min": 1.0,
+          "max": 6.0,
+          "step": 0.5,
+          "tooltip": "Flow schedule shift. 1.0 = uniform; higher spends more steps on the high-noise (global shape) end. Affects detail vs overall form."
+        },
+        {
+          "id": "num_gaussians",
+          "label": "Gaussians",
+          "type": "select",
+          "default": 262144,
+          "options": [
+            { "value": 65536,  "label": "65k (fast)" },
+            { "value": 131072, "label": "131k" },
+            { "value": 262144, "label": "262k (best)" }
+          ],
+          "tooltip": "Number of Gaussians to decode. More = denser point cloud and finer mesh detail."
+        },
+        {
+          "id": "mesh_detail",
+          "label": "Mesh Detail",
+          "type": "select",
+          "default": 9,
+          "options": [
+            { "value": 7,  "label": "Low (7)" },
+            { "value": 8,  "label": "Medium (8)" },
+            { "value": 9,  "label": "High (9)" },
+            { "value": 10, "label": "Ultra (10)" }
+          ],
+          "tooltip": "Poisson reconstruction depth. Higher = sharper geometry but slower and more triangles (and more noise to smooth in the Texture node)."
+        },
+        {
+          "id": "erode_radius",
+          "label": "Edge Cleanup",
+          "type": "int",
+          "default": 1,
+          "min": 0,
+          "max": 5,
+          "tooltip": "Pixels eroded from the background-removal mask before compositing. Higher removes more edge halo/bleed around the subject. 0 disables."
+        },
         {
           "id": "seed",
           "label": "Seed",
@@ -26,6 +90,60 @@
           "min": -1,
           "max": 4294967295,
           "tooltip": "Seed for reproducibility. Set to -1 for a random seed."
+        }
+      ]
+    },
+    {
+      "id": "texture",
+      "name": "Texture & Smooth",
+      "input": "image",
+      "inputs": ["image", "mesh"],
+      "output": "mesh",
+      "params_schema": [
+        {
+          "id": "surface_smoothing",
+          "label": "Surface Smoothing",
+          "type": "select",
+          "default": "Light",
+          "options": [
+            { "value": "None",   "label": "None" },
+            { "value": "Light",  "label": "Light" },
+            { "value": "Medium", "label": "Medium" },
+            { "value": "Strong", "label": "Strong" }
+          ],
+          "tooltip": "Taubin smoothing strength (volume-preserving). Removes the Poisson orange-peel. Strong = very smooth but loses fine detail."
+        },
+        {
+          "id": "uv_quality",
+          "label": "UV Quality",
+          "type": "select",
+          "default": "Trivial",
+          "options": [
+            { "value": "Trivial", "label": "Trivial (fast, robust)" },
+            { "value": "Voronoi", "label": "Voronoi (cleaner atlas)" }
+          ],
+          "tooltip": "UV unwrap method for the texture bake. Voronoi packs fewer seams but needs a clean manifold mesh (auto-falls back to Trivial)."
+        },
+        {
+          "id": "texture_size",
+          "label": "Texture Size",
+          "type": "select",
+          "default": 2048,
+          "options": [
+            { "value": 1024, "label": "1024" },
+            { "value": 2048, "label": "2048" },
+            { "value": 4096, "label": "4096" }
+          ],
+          "tooltip": "Resolution of the baked color texture atlas. Higher = sharper surface color but larger file."
+        },
+        {
+          "id": "faces",
+          "label": "Max Faces",
+          "type": "int",
+          "default": -1,
+          "min": -1,
+          "max": 1000000,
+          "tooltip": "Target face count after smoothing (quadric decimation). -1 to keep full density."
         }
       ]
     }

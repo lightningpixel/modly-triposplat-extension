@@ -24,13 +24,35 @@ import json
 import platform
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
+
+# Official Space holding the pure-Python model code (triposplat.py + model.py)
+_SPACE_ZIP   = "https://huggingface.co/spaces/VAST-AI/TripoSplat/resolve/main/{name}"
+_MODEL_FILES = ("triposplat.py", "model.py")
 
 
 def pip(venv: Path, *args: str) -> None:
     is_win = platform.system() == "Windows"
     pip_exe = venv / ("Scripts/pip.exe" if is_win else "bin/pip")
     subprocess.run([str(pip_exe), *args], check=True)
+
+
+def fetch_model_code(ext_dir: Path) -> None:
+    """Download triposplat.py + model.py into vendor/ if build_vendor.py did not
+    already commit them. Both are pure Python — no compilation."""
+    vendor = ext_dir / "vendor"
+    vendor.mkdir(parents=True, exist_ok=True)
+    for name in _MODEL_FILES:
+        dest = vendor / name
+        if dest.exists():
+            print(f"[setup] {name} already present in vendor/, skipping.")
+            continue
+        url = _SPACE_ZIP.format(name=name)
+        print(f"[setup] Downloading {name} …")
+        with urllib.request.urlopen(url, timeout=120) as resp:
+            dest.write_bytes(resp.read())
+    print("[setup] Model code ready in vendor/.")
 
 
 def setup(
@@ -87,7 +109,16 @@ def setup(
         pip(venv, "install", "torch", "torchvision")
 
     # ------------------------------------------------------------------ #
-    # Core dependencies (TripoSplat is intentionally lightweight)
+    # Core dependencies
+    #   - model runtime: numpy / safetensors / pillow / tqdm
+    #   - weight download: huggingface_hub
+    #   - Gaussian -> mesh: pymeshlab (screened Poisson reconstruction) +
+    #     scipy (nearest-neighbour colour transfer) + trimesh (GLB export)
+    #
+    # Note: open3d is intentionally avoided — on Windows its jupyter/dash
+    # dependency tree trips the 260-char MAX_PATH limit during install, and it
+    # hard-imports plotly at module load. pymeshlab is a single self-contained
+    # wheel (already used elsewhere in Modly) with no such baggage.
     # ------------------------------------------------------------------ #
     print("[setup] Installing core dependencies …")
     pip(venv, "install",
@@ -96,7 +127,16 @@ def setup(
         "Pillow",
         "tqdm",
         "huggingface_hub",
+        "trimesh",
+        "pymeshlab",
+        "scipy",
     )
+
+    # ------------------------------------------------------------------ #
+    # Model source code (pure Python, fetched from the official Space)
+    # ------------------------------------------------------------------ #
+    print("[setup] Fetching TripoSplat model code …")
+    fetch_model_code(ext_dir)
 
     print("[setup] Done. Venv ready at:", venv)
 

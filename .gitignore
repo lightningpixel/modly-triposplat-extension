@@ -1,0 +1,8 @@
+# Per-extension virtualenv created by setup.py at install time
+venv/
+
+# Python caches
+__pycache__/
+*.pyc
+
+# vendor/ IS committed on purpose (pure-Python model code, no runtime fetch)
