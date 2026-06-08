@@ -13,21 +13,35 @@ extension **reconstructs the Gaussians into a watertight, vertex-colored `.glb`*
 
 ```
 image → BiRefNet (bg removal) → DINOv3 → flow sampling → Gaussian decode
-      → colored point cloud → screened Poisson (pymeshlab) → .glb mesh
+      → anisotropic density grid (covariance-rasterized) → Surface Nets
+      → component cleanup → Taubin smooth → colored .glb mesh
 ```
 
-The mesh keeps the Gaussians' color (SH DC → vertex colors carried through Poisson).
+The mesh path is **ported from ComfyUI's native `SplatToMesh`** (`splat_mesh.py`):
+each Gaussian is rasterized as its oriented 3-sigma covariance disk into a density
+grid, the iso-surface is extracted with Surface Nets at an Otsu-picked level, and
+vertex colors are sampled from a co-splatted color volume. This respects each
+splat's opacity and scale+rotation, so the surface fills solidly instead of
+pitting. A mesh is still a lossy approximation of the splats; expect a clean,
+recognizable shape rather than the fidelity of a native splat render.
+
+The mesh keeps the Gaussians' color (SH DC → vertex colors sampled from the color volume).
 
 ## Parameters
 
 | Param | Default | Notes |
 |-------|---------|-------|
-| Sampling Steps | 20 | Euler flow-matching steps. 10–20 recommended. |
-| CFG Scale | 3.0 | Guidance strength. ≤1 disables CFG. |
+| Sampling Steps | 20 | Euler flow-matching steps. 10–25 recommended. |
 | Gaussians | 262k | 65k / 131k / 262k. More = denser cloud, finer mesh. |
-| Mesh Detail | 9 | Poisson depth (7–10). Higher = sharper, slower, more tris. |
-| Max Faces | -1 | Quadric decimation target after reconstruction. -1 = off. |
+| Mesh Detail | High (9) | Surface-Nets grid res (7→160 … 10→288). Higher = finer, slower. |
+| Mesh Smoothing | Medium | Taubin iterations during reconstruction. Lower = crisper but noisier. |
 | Seed | -1 | -1 = random. |
+
+Each run also writes the raw Gaussian splat next to the `.glb` (`.ply` 3DGS + `.splat`)
+for viewing in a native splat viewer (e.g. SuperSplat) at full fidelity.
+
+CFG scale, flow shift, and mask erosion are fixed internally (no practical effect
+in this image-to-3D path, so kept off the UI).
 
 ## Dependencies
 
