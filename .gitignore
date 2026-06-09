@@ -6,3 +6,6 @@ __pycache__/
 *.pyc
 
 # vendor/ IS committed on purpose (pure-Python model code, no runtime fetch)
+
+# Local dev session backups — never ship
+_backup_session_*/
