@@ -4,11 +4,15 @@
   "type": "model",
   "source": "https://github.com/lightningpixel/modly-triposplat-extension",
   "description": "Single image to 3D via feed-forward Gaussian Splatting (up to 262k Gaussians), reconstructed into a vertex-colored mesh. By Tripo AI / VAST AI Research. Requires ~10GB VRAM.",
-  "version": "2.2.0",
+  "version": "2.6.0",
   "author": "Lorchie",
   "generator_class": "TripoSplatGenerator",
   "vram_gb": 10,
-  "tags": ["image-to-3d", "gaussian-splatting", "fast"],
+  "tags": [
+    "image-to-3d",
+    "gaussian-splatting",
+    "fast"
+  ],
   "nodes": [
     {
       "id": "generate",
@@ -34,9 +38,18 @@
           "type": "select",
           "default": 262144,
           "options": [
-            { "value": 65536,  "label": "65k (fast)" },
-            { "value": 131072, "label": "131k" },
-            { "value": 262144, "label": "262k (best)" }
+            {
+              "value": 65536,
+              "label": "65k (fast)"
+            },
+            {
+              "value": 131072,
+              "label": "131k"
+            },
+            {
+              "value": 262144,
+              "label": "262k (best)"
+            }
           ],
           "tooltip": "Number of Gaussians to decode. More = denser point cloud and finer mesh detail."
         },
@@ -46,10 +59,22 @@
           "type": "select",
           "default": 9,
           "options": [
-            { "value": 7,  "label": "Low (7)" },
-            { "value": 8,  "label": "Medium (8)" },
-            { "value": 9,  "label": "High (9)" },
-            { "value": 10, "label": "Ultra (10)" }
+            {
+              "value": 7,
+              "label": "Low (7)"
+            },
+            {
+              "value": 8,
+              "label": "Medium (8)"
+            },
+            {
+              "value": 9,
+              "label": "High (9)"
+            },
+            {
+              "value": 10,
+              "label": "Ultra (10)"
+            }
           ],
           "tooltip": "Surface-Nets grid resolution. Higher = finer surface detail (ears, edges) but slower and more triangles."
         },
@@ -59,10 +84,22 @@
           "type": "select",
           "default": "Medium",
           "options": [
-            { "value": "None",   "label": "None (crispest)" },
-            { "value": "Light",  "label": "Light" },
-            { "value": "Medium", "label": "Medium" },
-            { "value": "Strong", "label": "Strong (softest)" }
+            {
+              "value": "None",
+              "label": "None (crispest)"
+            },
+            {
+              "value": "Light",
+              "label": "Light"
+            },
+            {
+              "value": "Medium",
+              "label": "Medium"
+            },
+            {
+              "value": "Strong",
+              "label": "Strong (softest)"
+            }
           ],
           "tooltip": "Taubin smoothing applied during reconstruction. Lower keeps crisper edges/relief; higher gives a softer, rounder surface."
         },
@@ -72,10 +109,45 @@
           "type": "select",
           "default": "Natural",
           "options": [
-            { "value": "Natural", "label": "Natural" },
-            { "value": "Vivid",   "label": "Vivid (more saturated)" }
+            {
+              "value": "Natural",
+              "label": "Natural"
+            },
+            {
+              "value": "Vivid",
+              "label": "Vivid (more saturated)"
+            },
+            {
+              "value": "Refined",
+              "label": "Refined (+30-60s)"
+            }
           ],
-          "tooltip": "Natural matches ComfyUI's color exactly. Vivid pre-boosts saturation to offset the viewer's tone-mapping (punchier yellows; darks stay neutral)."
+          "tooltip": "Natural matches ComfyUI's color exactly. Vivid pre-boosts saturation to offset the viewer's tone-mapping. Refined fits the colors (vertex colors, or texture texels with Baked 1K/2K) to multi-view renders of the Gaussian splat — measurably closer to the splat's look."
+        },
+        {
+          "id": "texture",
+          "label": "Texture",
+          "type": "select",
+          "default": "Auto",
+          "options": [
+            {
+              "value": "Auto",
+              "label": "Auto (best, +2min)"
+            },
+            {
+              "value": "Vertex colors",
+              "label": "Vertex colors (fast)"
+            },
+            {
+              "value": "Baked 1K",
+              "label": "Baked 1K"
+            },
+            {
+              "value": "Baked 2K",
+              "label": "Baked 2K"
+            }
+          ],
+          "tooltip": "Auto: builds BOTH refined color paths (vertex colors and a baked 2K texture fitted to splat renders) and keeps whichever matches the splat best on held-out validation views — the most faithful result on any object type. Vertex colors: fast single path. Baked 1K/2K: always use a UV texture."
         },
         {
           "id": "seed",
@@ -112,9 +184,18 @@
           "type": "select",
           "default": 262144,
           "options": [
-            { "value": 65536,  "label": "65k (fast)" },
-            { "value": 131072, "label": "131k" },
-            { "value": 262144, "label": "262k (best)" }
+            {
+              "value": 65536,
+              "label": "65k (fast)"
+            },
+            {
+              "value": 131072,
+              "label": "131k"
+            },
+            {
+              "value": 262144,
+              "label": "262k (best)"
+            }
           ],
           "tooltip": "Number of Gaussians to decode. More = denser, higher-fidelity splat."
         },
@@ -133,7 +214,10 @@
       "id": "projection",
       "name": "TripoSplat (Projection)",
       "input": "image",
-      "inputs": ["image", "mesh"],
+      "inputs": [
+        "image",
+        "mesh"
+      ],
       "output": "mesh",
       "hf_repo": "VAST-AI/TripoSplat",
       "download_check": "../generate/diffusion_models/triposplat_fp16.safetensors",
@@ -145,8 +229,14 @@
           "type": "select",
           "default": "Aligned (ICP)",
           "options": [
-            { "value": "Direct",        "label": "Direct (fast)" },
-            { "value": "Aligned (ICP)", "label": "Aligned (ICP)" }
+            {
+              "value": "Direct",
+              "label": "Direct (fast)"
+            },
+            {
+              "value": "Aligned (ICP)",
+              "label": "Aligned (ICP)"
+            }
           ],
           "tooltip": "Projects the splat's color onto the wired mesh via inverse-distance k-NN. Both modes auto-correct gross rotation (yaw) and drop transparent floater gaussians. Aligned (ICP) adds an ICP registration step for the residual fine misalignment."
         },
@@ -156,10 +246,22 @@
           "type": "select",
           "default": "Vivid + Bright",
           "options": [
-            { "value": "Natural",        "label": "Natural" },
-            { "value": "Vivid",          "label": "Vivid (saturation)" },
-            { "value": "Bright",         "label": "Bright (lift values)" },
-            { "value": "Vivid + Bright", "label": "Vivid + Bright" }
+            {
+              "value": "Natural",
+              "label": "Natural"
+            },
+            {
+              "value": "Vivid",
+              "label": "Vivid (saturation)"
+            },
+            {
+              "value": "Bright",
+              "label": "Bright (lift values)"
+            },
+            {
+              "value": "Vivid + Bright",
+              "label": "Vivid + Bright"
+            }
           ],
           "tooltip": "The viewer shows vertex color as-is, so raw splat colors look dark. Vivid boosts saturation (native formula); Bright applies a gamma lift so whites read white instead of grey. Vivid + Bright does both."
         },
@@ -178,9 +280,18 @@
           "type": "select",
           "default": 262144,
           "options": [
-            { "value": 65536,  "label": "65k (fast)" },
-            { "value": 131072, "label": "131k" },
-            { "value": 262144, "label": "262k (best)" }
+            {
+              "value": 65536,
+              "label": "65k (fast)"
+            },
+            {
+              "value": 131072,
+              "label": "131k"
+            },
+            {
+              "value": 262144,
+              "label": "262k (best)"
+            }
           ],
           "tooltip": "Number of Gaussians decoded for the color source. More = denser color sampling on the mesh."
         },

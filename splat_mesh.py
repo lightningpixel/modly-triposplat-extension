@@ -224,9 +224,24 @@ def _clean_components(verts, faces, min_verts):
     return verts[used], remap[faces]
 
 
+def _gaussian_blur3d(vol: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable 3D gaussian blur on a (X,Y,Z) volume. sigma in voxels."""
+    import torch.nn.functional as F
+    r = max(1, int(np.ceil(2.5 * sigma)))
+    x = torch.arange(-r, r + 1, device=vol.device, dtype=torch.float32)
+    k = torch.exp(-0.5 * (x / sigma) ** 2)
+    k = (k / k.sum()).reshape(1, 1, -1)
+    v = vol[None, None]                                  # (1,1,X,Y,Z)
+    v = F.conv3d(v, k.reshape(1, 1, -1, 1, 1), padding=(r, 0, 0))
+    v = F.conv3d(v, k.reshape(1, 1, 1, -1, 1), padding=(0, r, 0))
+    v = F.conv3d(v, k.reshape(1, 1, 1, 1, -1), padding=(0, 0, r))
+    return v[0, 0]
+
+
 def splat_to_mesh(xyz, opacity, scale, quat, rgb, *, resolution, device,
                   kernel=5, level_bias=0.4, min_component=500, min_opacity=0.02,
-                  color_sharpen=2.0, taubin=12, scale_floor_frac=0.9, vivid_color=False):
+                  color_sharpen=2.0, taubin=12, scale_floor_frac=0.9, vivid_color=False,
+                  vol_smooth=0.0, vol_smooth_color=None):
     """Full splat -> (verts f32, faces i64, colors f32 0..1, display space). Returns
     None if no surface. All inputs are torch tensors on `device`: xyz (N,3), opacity
     (N,), scale (N,3) linear std, quat (N,4) wxyz, rgb (N,3) display 0..1."""
@@ -241,14 +256,50 @@ def splat_to_mesh(xyz, opacity, scale, quat, rgb, *, resolution, device,
     # grid fragments into thousands of disconnected spikes (the "holes"). Spacing is
     # a property of the cloud (not the grid), so this stays solid at any resolution.
     # Geometry/density only — colour weighting is unaffected.
-    if scale_floor_frac > 0 and xyz.shape[0] > 8:
+    spacing = 0.0
+    if xyz.shape[0] > 8:
         xn = xyz.detach().cpu().numpy()
         sub = xn[np.random.default_rng(0).choice(len(xn), min(20000, len(xn)), replace=False)]
         spacing = float(np.median(cKDTree(xn).query(sub, k=2)[0][:, 1]))
-        scale = torch.clamp(scale, min=spacing * scale_floor_frac)
+        if scale_floor_frac > 0:
+            scale = torch.clamp(scale, min=spacing * scale_floor_frac)
 
     vol, colvol, colnorm, origin, voxel = _splat_density(
         xyz, opacity, scale, quat, rgb, resolution, kernel, device, color_sharpen=color_sharpen)
+
+    # Crevasse suppression: the density dips between neighbouring gaussians at
+    # ~1-voxel wavelength (inter-gaussian spacing ≈ voxel size at res 224), so the
+    # iso-surface carries high-frequency valleys. A ~1-voxel blur of the density
+    # grid removes them at the source; the level is re-estimated on the blurred
+    # volume below. The colour volume gets the SAME blur: the smoothed surface
+    # sits up to ~half a voxel off the raw one, where the unblurred colnorm can be
+    # near-zero — sampling num/den there produces ring/moire colour artifacts.
+    # vol_smooth_color: colour-volume blur sigma; defaults to the geometry sigma.
+    # The colour blur must stay > 0 (the smoothed surface sits where the raw
+    # colnorm can be ~0 → ring/moire artifacts) but can be SMALLER than the
+    # geometry blur to keep texture detail (wood grain, plank seams) crisper.
+    #
+    # ADAPTIVE SIGMA (upward only): at the default config the gaussian spacing is
+    # SUB-voxel (spacing/voxel ≈ 0.4 at 262k @ res 224) and the crevasses are
+    # voxel-scale noise — the calibrated vol_smooth handles them. When the cloud
+    # is sparse relative to the grid (low gaussian counts, Ultra resolution), the
+    # inter-gaussian valleys span spacing/voxel voxels and a fixed sigma would
+    # leave them in → scale UP with the ratio. Never scale below the validated
+    # default; cap at 2.5x so extreme clouds cannot melt features.
+    if vol_smooth > 0:
+        ratio = (spacing / voxel) if (spacing > 0 and voxel > 0) else 0.4
+        mult = min(max(ratio / 0.9, 1.0), 2.5)
+        s = float(vol_smooth) * mult
+        sc = s if vol_smooth_color is None else float(vol_smooth_color) * mult
+        if mult != 1.0:
+            print(f"[splat_mesh] vol_smooth adaptive: spacing/voxel={ratio:.2f} "
+                  f"-> sigma {s:.2f} (x{mult:.2f})", flush=True)
+        vol = _gaussian_blur3d(vol, s)
+        if sc > 0:
+            colnorm = _gaussian_blur3d(colnorm.float(), sc)
+            colvol = torch.stack([_gaussian_blur3d(colvol[..., ch].float(), sc)
+                                  for ch in range(3)], dim=-1)
+
     colvol_np = colvol.float().cpu().numpy()
     colnorm_np = colnorm.float().cpu().numpy()
     del colvol, colnorm
@@ -257,15 +308,40 @@ def splat_to_mesh(xyz, opacity, scale, quat, rgb, *, resolution, device,
     occ = vol[vol > vmax * 1e-3]
     if occ.numel() == 0:
         return None
-    level = min(max(_otsu_level(occ.cpu().numpy()) * level_bias, vmin + 1e-6 * (vmax - vmin)),
-                vmax - 1e-6 * (vmax - vmin))
+    otsu = _otsu_level(occ.cpu().numpy())
 
-    verts, faces = _surface_nets(vol, level, voxel, origin, device)
+    # Connectivity-driven level selection. A single global level fragments splats
+    # whose surface density is locally weak (sparser / lower-opacity patches —
+    # the same Otsu-based level that extracts one object cleanly shreds another
+    # with near-identical global stats). If the largest connected component holds
+    # < 90% of the faces, retry with a lower level; keep the best attempt.
+    # Healthy objects accept the first try — zero extra cost.
+    best = None
+    best_ratio = -1.0
+    for lb_mult in (1.0, 0.7, 0.5):
+        level = min(max(otsu * level_bias * lb_mult, vmin + 1e-6 * (vmax - vmin)),
+                    vmax - 1e-6 * (vmax - vmin))
+        v_try, f_try = _surface_nets(vol, level, voxel, origin, device)
+        if min_component > 0 and len(f_try) > 0:
+            v_try, f_try = _clean_components(v_try, f_try, min_component)
+        if len(v_try) == 0 or len(f_try) == 0:
+            continue
+        e = np.concatenate([f_try[:, [0, 1]], f_try[:, [1, 2]], f_try[:, [0, 2]]], 0)
+        ncomp, label = connected_components(
+            coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])),
+                       shape=(len(v_try), len(v_try))), directed=False)
+        fcount = np.bincount(label[f_try[:, 0]], minlength=ncomp)
+        ratio = float(fcount.max()) / max(len(f_try), 1)
+        if ratio > best_ratio:
+            best, best_ratio = (v_try, f_try), ratio
+        if ratio >= 0.90:
+            break
+        print(f"[splat_mesh] fragmented at level_bias {level_bias * lb_mult:.2f} "
+              f"(main component {ratio * 100:.0f}%) — lowering level", flush=True)
     del vol
-    if min_component > 0 and len(faces) > 0:
-        verts, faces = _clean_components(verts, faces, min_component)
-    if len(verts) == 0 or len(faces) == 0:
+    if best is None:
         return None
+    verts, faces = best
 
     verts = _taubin_smooth(verts, faces, taubin)
 
