@@ -408,6 +408,21 @@ class TripoSplatGenerator(BaseGenerator):
             elif fill_mode != "Off":
                 verts, faces, colors = self._close_holes(verts, faces, colors)
 
+        # Vertex budget: the geomean voxel grid hands elongated objects their full
+        # res^3 budget, which at Ultra can mean 1.8-2.6M faces — every downstream
+        # refine scales with it and the GLB balloons. Colour-aware decimation to
+        # 1M is render-indistinguishable (measured: truck 2.55M -> 1M, SSIM
+        # 0.8865 -> 0.8866 at 512, identical at 128; cat -0.001) because vertex
+        # quality = local colour gradient protects detail (eyes, patterns) while
+        # flat regions collapse. ~20 s, repaid 2-3x by the refines.
+        if len(faces) > 1_200_000:
+            try:
+                verts, faces, colors = self._decimate_color_budget(
+                    verts, faces, colors, 1_000_000)
+            except Exception as exc:
+                print(f"[TripoSplatGenerator] budget decimation skipped ({exc})",
+                      flush=True)
+
         # Sample reference point cloud from the filled high-res mesh (before any decimation).
         # Saved to .gaussians.npz as 'ref_pts' for chamfer-distance bench (independent fidelity).
         # Also stash the Standard mesh (Z-up, pre-refine) so _save_splats can embed the
@@ -726,6 +741,38 @@ class TripoSplatGenerator(BaseGenerator):
         return v2, f2, colors[idx]
 
     @staticmethod
+    def _decimate_color_budget(verts, faces, colors, target: int):
+        """Quadric decimation weighted by the local colour gradient: vertex
+        quality = mean |dRGB| over incident edges (normalized at p95, weight up
+        to 10x), so colour detail survives while uniform regions collapse.
+        Colours are re-mapped by nearest original vertex."""
+        import pymeshlab as ml
+        from scipy.spatial import cKDTree
+        e = np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [0, 2]]], 0)
+        dc = np.linalg.norm(colors[e[:, 0]] - colors[e[:, 1]], axis=1)
+        grad = np.zeros(len(verts), np.float64)
+        cnt = np.zeros(len(verts), np.float64)
+        np.add.at(grad, e[:, 0], dc)
+        np.add.at(grad, e[:, 1], dc)
+        np.add.at(cnt, e[:, 0], 1)
+        np.add.at(cnt, e[:, 1], 1)
+        grad /= np.maximum(cnt, 1)
+        q = np.clip(1.0 + 9.0 * grad / max(np.percentile(grad, 95), 1e-9), 1.0, 10.0)
+        ms = ml.MeshSet()
+        ms.add_mesh(ml.Mesh(vertex_matrix=verts.astype(np.float64),
+                            face_matrix=faces.astype(np.int32),
+                            v_scalar_array=q))
+        ms.meshing_decimation_quadric_edge_collapse(
+            targetfacenum=int(target), preservetopology=True, qualityweight=True)
+        cm = ms.current_mesh()
+        nv = np.ascontiguousarray(cm.vertex_matrix(), np.float32)
+        nf = np.ascontiguousarray(cm.face_matrix(), np.int64)
+        _, idx = cKDTree(verts).query(nv, k=1)
+        print(f"[TripoSplatGenerator] vertex budget: {len(faces)} -> {len(nf)} faces "
+              f"(colour-aware)", flush=True)
+        return nv, nf, colors[idx]
+
+    @staticmethod
     def _decimate(mesh, target: int):
         """Quadric edge-collapse decimation via pymeshlab (already a dependency)."""
         import pymeshlab as ml
@@ -742,18 +789,41 @@ class TripoSplatGenerator(BaseGenerator):
     # Shared helpers
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _smooth_vertex_normals(mesh):
+        """Feature-preserving (BILATERAL) smoothed vertex normals, positions untouched.
+
+        The area-weighted normals of a high-res Surface-Nets mesh carry the grid's
+        sub-voxel relief noise. UNLIT that is invisible (flat DC colour), but the
+        Modly viewer LIGHTS the mesh from the stored normals, so the noise shades
+        as mottling/orange-peel — the "c'est moche" complaint. A bilateral normal
+        filter (neighbour weight by normal similarity) kills that high-frequency
+        noise while PRESERVING genuine creases/features — a uniform Laplacian smears
+        them (the see-saw: cleaning the duck smeared the cat's muzzle). Shared with
+        the LIT regression harness (debug/lit_regression.py) so what ships is what
+        was validated. Bilateral >= Laplacian on all 9 test objects (LIT)."""
+        from splatforge.normals import smooth_normals
+        return smooth_normals(np.asarray(mesh.vertices, np.float32),
+                              np.asarray(mesh.faces, np.int64),
+                              normals0=np.asarray(mesh.vertex_normals, np.float32),
+                              iters=20, mode="bilateral", sigma=0.30)
+
     def _export(self, mesh, progress_cb) -> Path:
         self.outputs_dir.mkdir(parents=True, exist_ok=True)
         name = f"{int(time.time())}_{uuid.uuid4().hex[:8]}.glb"
         path = self.outputs_dir / name
-        # Smooth area-weighted vertex normals: touching the property caches them,
-        # which makes trimesh write the NORMAL attribute. Without it the viewer
-        # computes its own (often flat per-face) normals — on a 500k-face surface
-        # that reads as noisy/faceted shading.
+        # Write SMOOTHED vertex normals so trimesh stores the NORMAL attribute.
+        # Without explicit normals the viewer computes flat per-face ones (noisy
+        # faceting); with the raw area-weighted ones the grid relief shades as
+        # mottling under the viewer's lighting. Smoothing the normals fixes both.
         try:
-            _ = mesh.vertex_normals
-        except Exception:
-            pass
+            mesh.vertex_normals = self._smooth_vertex_normals(mesh)
+        except Exception as exc:
+            print(f"[TripoSplatGenerator] normal smoothing skipped ({exc})", flush=True)
+            try:
+                _ = mesh.vertex_normals
+            except Exception:
+                pass
         mesh.export(str(path))
         self._finalize_glb(path)
         self._report(progress_cb, 100, "Done")

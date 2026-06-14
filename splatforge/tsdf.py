@@ -161,7 +161,8 @@ def splat_to_mesh_repair(xyz, opacity, scale, quat, rgb, *, resolution, device,
     if str(_ext) not in _sys.path:
         _sys.path.insert(0, str(_ext))
     from splat_mesh import (_splat_density, _otsu_level, _surface_nets,
-                            _clean_components, _taubin_smooth, _gaussian_blur3d)
+                            _clean_components, _taubin_smooth, _gaussian_blur3d,
+                            _filament_stamp)
     from scipy.spatial import cKDTree
     from .render.mesh import render_mesh
 
@@ -186,6 +187,9 @@ def splat_to_mesh_repair(xyz, opacity, scale, quat, rgb, *, resolution, device,
     if occ.numel() == 0:
         return None
     level = _otsu_level(occ.cpu().numpy()) * 0.4
+
+    # filament (whisker) recovery — same pass as splat_to_mesh, no-op when clean
+    vol_s, _nfil = _filament_stamp(vol_s, level, xyz, origin, voxel, device)
 
     v0, f0 = _surface_nets(vol_s, level, voxel, origin, device)
     if min_component > 0 and len(f0) > 0:

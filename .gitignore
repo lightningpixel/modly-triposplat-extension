@@ -15,6 +15,5 @@ _backup_session_*/
 # are kept; only their heavy output is ignored.
 **/bench_out/
 
-# Debug scratch data dumps (the debug/*.py scripts are kept, the data is not)
-debug/*.npz
-debug/*.txt
+# Debug scratch — dev-only scripts and data dumps, never shipped to users
+debug/

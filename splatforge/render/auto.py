@@ -125,19 +125,31 @@ def pick_color_path(vertex_mesh: tuple, texture_mesh: tuple,
     tex = torch.as_tensor(texture_mesh[3].astype(np.float32) / 255.0, device=device)
     dummy = torch.zeros(len(tv), 3, device=device)
 
-    cams = make_rig(np.asarray(vertex_mesh[0], np.float32), k=n_val_views,
-                    res=res, phase=_GOLDEN / 3)
-
-    v_psnr, v_ssim = _eval_candidate(vv, vf, vc, None, gaussians, cams, ssaa, device)
-    t_psnr, t_ssim = _eval_candidate(tv, tf, dummy, (uvs, tex), gaussians, cams,
-                                     ssaa, device)
+    # Multi-scale: the viewer shows the object SMALL (mip 2-3), where a
+    # fragmented UV atlas bleeds across island borders. A full-frame 512 eval
+    # overestimates the texture path (measured: texture won the gate on a cat
+    # whose shattered atlas looked dirty in the viewer; at 128 px the same
+    # texture lost its lead). Score both candidates at full and quarter res and
+    # decide on the MEAN SSIM — vertex colours are scale-stable, a healthy
+    # atlas keeps its win, a shattered one is caught.
+    v_ps, v_ss, t_ps, t_ss = [], [], [], []
+    for r in (res, max(res // 4, 96)):
+        cams = make_rig(np.asarray(vertex_mesh[0], np.float32), k=n_val_views,
+                        res=r, phase=_GOLDEN / 3)
+        vp, vs = _eval_candidate(vv, vf, vc, None, gaussians, cams, ssaa, device)
+        tp, ts = _eval_candidate(tv, tf, dummy, (uvs, tex), gaussians, cams,
+                                 ssaa, device)
+        v_ps.append(vp); v_ss.append(vs); t_ps.append(tp); t_ss.append(ts)
+        print(f"[auto] res={r}: vertex psnr={vp:.2f} ssim={vs:.4f} | "
+              f"texture psnr={tp:.2f} ssim={ts:.4f}", flush=True)
+    v_psnr, v_ssim = float(np.mean(v_ps)), float(np.mean(v_ss))
+    t_psnr, t_ssim = float(np.mean(t_ps)), float(np.mean(t_ss))
 
     if abs(t_ssim - v_ssim) > 1e-4:
         winner = "texture" if t_ssim > v_ssim else "vertex"
     else:
         winner = "texture" if t_psnr >= v_psnr else "vertex"
-    print(f"[auto] vertex  psnr={v_psnr:.2f} ssim={v_ssim:.4f}\n"
-          f"[auto] texture psnr={t_psnr:.2f} ssim={t_ssim:.4f}\n"
-          f"[auto] -> {winner}", flush=True)
+    print(f"[auto] mean: vertex ssim={v_ssim:.4f} | texture ssim={t_ssim:.4f}"
+          f" -> {winner}", flush=True)
     return {"winner": winner, "vertex": (v_psnr, v_ssim),
             "texture": (t_psnr, t_ssim)}
