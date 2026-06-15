@@ -114,7 +114,8 @@ def setup(
     #   - weight download: huggingface_hub
     #   - Gaussian -> mesh: torch (anisotropic density grid + Surface Nets, ported
     #     from ComfyUI's SplatToMesh) + scipy (components, colour sampling, Taubin) +
-    #     trimesh (GLB export) + pymeshlab (decimation + texture-node UV/bake)
+    #     trimesh (GLB export) + pymeshlab (decimation + texture-node UV/bake) +
+    #     xatlas (UV unwrap for the baked-texture path)
     #
     # Note: open3d is intentionally avoided — on Windows its jupyter/dash
     # dependency tree trips the 260-char MAX_PATH limit during install, and it
@@ -131,6 +132,7 @@ def setup(
         "trimesh",
         "pymeshlab",
         "scipy",
+        "xatlas==0.0.9",
     )
 
     # ------------------------------------------------------------------ #

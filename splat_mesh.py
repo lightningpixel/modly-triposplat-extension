@@ -16,7 +16,8 @@ pre-boosts saturation. The glTF Y/Z flip is handled by the caller.
 """
 import numpy as np
 import torch
-from scipy.ndimage import map_coordinates, minimum as _ndi_min, maximum as _ndi_max
+from scipy.ndimage import (map_coordinates, minimum as _ndi_min, maximum as _ndi_max,
+                           distance_transform_edt, binary_fill_holes)
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
 from scipy.spatial import cKDTree
@@ -45,8 +46,16 @@ def _splat_density(xyz, opacity, scale, quat, rgb, res, kernel, device,
     pad = 4.0 * scale.median()
     lo = xyz.amin(0) - pad
     hi = xyz.amax(0) + pad
-    voxel = ((hi - lo).max() / res).clamp_min(1e-8)
-    dx, dy, dz = (torch.ceil((hi - lo) / voxel).long() + 1).tolist()
+    # Voxel size from the GEOMETRIC MEAN of the extents, not the max: the grid is
+    # already non-cubic (dims = extent/voxel), so a max-based voxel hands an
+    # elongated object (T-pose character, car) only a fraction of the res^3
+    # budget — an arm-span-dominated bbox can waste >80% of it on empty space,
+    # melting small features (eyes). geomean keeps the total voxel count at
+    # ~res^3 for ANY aspect ratio; cube-ish objects are unchanged. Refinement
+    # capped at 2x so needle-like objects cannot stretch one axis absurdly.
+    ext = (hi - lo).clamp_min(1e-8)
+    voxel = (ext.prod().pow(1.0 / 3.0) / res).clamp(min=ext.max() / (2.0 * res))
+    dx, dy, dz = (torch.ceil(ext / voxel).long() + 1).tolist()
 
     sinv = _inverse_covariance(scale, quat)
     kreq = torch.ceil(3.0 * scale.amax(-1) / voxel).long().clamp(1, int(kernel))
@@ -224,9 +233,195 @@ def _clean_components(verts, faces, min_verts):
     return verts[used], remap[faces]
 
 
+def _gaussian_blur3d(vol: torch.Tensor, sigma: float) -> torch.Tensor:
+    """Separable 3D gaussian blur on a (X,Y,Z) volume. sigma in voxels."""
+    import torch.nn.functional as F
+    r = max(1, int(np.ceil(2.5 * sigma)))
+    x = torch.arange(-r, r + 1, device=vol.device, dtype=torch.float32)
+    k = torch.exp(-0.5 * (x / sigma) ** 2)
+    k = (k / k.sum()).reshape(1, 1, -1)
+    v = vol[None, None]                                  # (1,1,X,Y,Z)
+    v = F.conv3d(v, k.reshape(1, 1, -1, 1, 1), padding=(r, 0, 0))
+    v = F.conv3d(v, k.reshape(1, 1, 1, -1, 1), padding=(0, r, 0))
+    v = F.conv3d(v, k.reshape(1, 1, 1, 1, -1), padding=(0, 0, r))
+    return v[0, 0]
+
+
+def _filament_stamp(vol_s, level, xyz, origin, voxel, device,
+                    min_chain=6, min_elong=9.0, min_elong_floor=8.0,
+                    min_len_vox=4.0, max_chains=64, amp_frac=1.8,
+                    sigma_vox=0.7, link_r=2.0):
+    """Filament (whisker) recovery pass — per-object gated, no-op when nothing
+    thin is detected.
+
+    Sub-voxel filaments (whiskers, antennae) never cross the iso-level: their
+    density tube is ~0.4 voxel across even after the scale floor, so the mesh
+    silently loses them (no knob brings them back — verified by ablation on
+    min_component / vol_smooth / scale_floor). Recovery: gaussians sitting BELOW
+    the level, OUTSIDE the filled occupancy and >2 voxels away from it are
+    clustered; elongated chains (the filaments) are re-stamped into the density
+    volume as thin capsules so Surface Nets extracts them, welded to the body by
+    extending the root end until it penetrates the surface. Colour needs no
+    work: the co-splatted colour volume already holds the filament colours.
+
+    Returns (vol_s, n_chains); vol_s is the SAME tensor when n_chains == 0.
+    """
+    from scipy.ndimage import label as _ndi_label
+    from scipy.sparse.csgraph import minimum_spanning_tree
+
+    vol_np = vol_s.cpu().numpy()
+    occ_b = vol_np > level
+    # reference body = LARGEST occupied component only: partially-extracted
+    # filaments (chair wire trusses) leave their own occ fragments, and a
+    # distance to *all* occupancy would exclude their gaussians as "too close"
+    # (to themselves). Fragments are dropped from the reference, so filament
+    # gaussians measure their distance to the actual body.
+    lab3, nlab = _ndi_label(occ_b)
+    if nlab == 0:
+        return vol_s, 0
+    main = np.bincount(lab3.ravel())[1:].argmax() + 1
+    body = binary_fill_holes(lab3 == main)
+    edt = distance_transform_edt(~body)                 # voxels, 0 inside body
+    ijk = ((xyz - torch.as_tensor(origin, device=device)) / voxel).cpu().numpy()
+    dist_at = map_coordinates(edt, ijk.T, order=1, mode="nearest")
+    cand = dist_at > 2.0
+    ncand = int(cand.sum())
+    if ncand < min_chain or ncand > 100000:             # nothing, or degenerate fuzz
+        return vol_s, 0
+
+    cpts = ijk[cand]
+    dvals = dist_at[cand]
+    pairs = cKDTree(cpts).query_pairs(r=link_r, output_type="ndarray")
+    ncomp, lab = connected_components(
+        coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                   shape=(len(cpts), len(cpts))), directed=False)
+
+    # Accept a cluster as filament if it is a 1D structure: either a straight
+    # chain (PCA-elongated) or a thin branched network (X-shaped wire trusses:
+    # MST total length ~ N * point spacing for a 1D network; blobs pack many
+    # points per unit length and fail). Stamp along MST edges (handles branches),
+    # weld every loose end near the body to it via EDT descent so the component
+    # cull cannot drop the tube.
+    segments = []                                       # (p0, p1) in voxel coords
+    n_keep = 0
+    for ci in range(ncomp):
+        m = lab == ci
+        npts = int(m.sum())
+        if npts < min_chain:
+            continue
+        # surface fuzz hugs the body at 2-3 voxels and would pass the 1D test
+        # as hair streaks; genuine filaments LEAVE the body. Require the bulk
+        # of the cluster to sit clearly away from the surface — but its root to
+        # TOUCH the body: floating debris trails (splat noise the component
+        # cull rightly removes) can line up and pass the linearity tests, and
+        # the pass must not resurrect them.
+        if np.percentile(dvals[m], 75) < 3.5 or float(dvals[m].min()) > 4.0:
+            continue
+        P = cpts[m]
+        if npts > 3000:                                 # cap MST cost on huge clusters
+            P = P[np.random.default_rng(0).choice(npts, 3000, replace=False)]
+            npts = 3000
+        C = P - P.mean(0)
+        w, V = np.linalg.eigh(C.T @ C / len(P))
+        extent = np.ptp(C @ V[:, -1])
+        if extent < min_len_vox:
+            continue
+        ktree = cKDTree(P)
+        kq = min(8, npts)
+        dd, ii = ktree.query(P, k=kq)
+        # local linearity: per-point PCA over the k-NN neighbourhood. A filament
+        # is locally a LINE (largest eigenvalue dominates); surface fuzz is a
+        # local cloud/sheet. (A global MST-length test cannot discriminate:
+        # MST length ~ N*spacing for ANY point set.)
+        nb = P[ii]                                      # (n, k, 3)
+        nb = nb - nb.mean(1, keepdims=True)
+        cov = np.einsum("nki,nkj->nij", nb, nb) / kq
+        ev = np.linalg.eigvalsh(cov)                    # ascending
+        loc_lin = float(np.mean(ev[:, 2] / np.maximum(ev.sum(1), 1e-12)))
+        elong = w[-1] / max(w[-2], 1e-9)
+        p75 = float(np.percentile(dvals[m], 75))
+        # accept: straight chain (whiskers) | locally clean lines | moderately
+        # linear network FAR from the body (wire trusses: X-junctions drag the
+        # local-linearity down to ~0.70, but surface fuzz never strays >15 vox).
+        # REQUIRE a minimum global elongation across ALL branches: dense FUR on a
+        # furry object (cat) forms short, locally-linear or far-but-blobby clusters
+        # (elong ~3-5) that the loc_lin / far-truss branches admitted as debris —
+        # the "chunk under the chin". Genuine filaments are very elongated (elong
+        # >= ~11 on every validated object: creature whiskers 10.7-57, chair trusses
+        # 43-130); the floor (8.0) sits comfortably between the two populations, so
+        # whiskers/trusses survive while fur debris is rejected. (stats: debug
+        # FILAMENT_DEBUG=1, design notes in the lit-shading/filament memories.)
+        ok = elong >= min_elong_floor and (
+            (elong >= min_elong) or (loc_lin >= 0.75) or (loc_lin >= 0.65 and p75 > 15.0))
+        import os as _os
+        if _os.environ.get("FILAMENT_DEBUG"):
+            print(f"  cluster n={npts} p75dist={p75:.1f} elong={elong:.1f} "
+                  f"loc_lin={loc_lin:.2f} {'ACCEPT' if ok else 'reject'}", flush=True)
+        if not ok:
+            continue
+        rows = np.repeat(np.arange(npts), dd.shape[1] - 1)
+        cols = ii[:, 1:].ravel()
+        vals = dd[:, 1:].ravel()
+        mst = minimum_spanning_tree(
+            coo_matrix((vals, (rows, cols)), shape=(npts, npts))).tocoo()
+        n_keep += 1
+        if n_keep > max_chains:
+            break
+        deg = np.bincount(np.concatenate([mst.row, mst.col]), minlength=npts)
+        for a, b in zip(mst.row, mst.col):
+            segments.append((P[a], P[b]))
+        # weld leaves that sit near the body (root ends); far tips stay free
+        for li in np.where(deg == 1)[0]:
+            p = P[li].astype(np.float64).copy()
+            if map_coordinates(edt, p[:, None], order=1)[0] > 6.0:
+                continue
+            prev = None
+            for _i in range(40):
+                e = map_coordinates(edt, p[:, None], order=1)[0]
+                if e <= 0.5:
+                    break
+                gx = np.array([map_coordinates(edt, (p + d)[:, None], order=1)[0]
+                               - map_coordinates(edt, (p - d)[:, None], order=1)[0]
+                               for d in np.eye(3) * 0.5])
+                ng = np.linalg.norm(gx)
+                if ng < 1e-9:
+                    break
+                step = p - gx / ng * 0.5
+                if prev is not None and np.linalg.norm(step - prev) < 1e-6:
+                    break
+                segments.append((p.copy(), step.copy()))
+                prev, p = p, step
+    if not segments:
+        return vol_s, 0
+
+    amp = amp_frac * level
+    r = int(np.ceil(3 * sigma_vox))
+    X, Y, Z = vol_np.shape
+    for p0, p1 in segments:
+        seg_len = np.linalg.norm(p1 - p0)
+        ts = np.arange(0.0, seg_len + 1e-9, 0.5) / max(seg_len, 1e-9)
+        for t in ts:
+            cx, cy, cz = p0 + (p1 - p0) * t
+            x0, x1 = max(int(cx) - r, 0), min(int(cx) + r + 1, X)
+            y0, y1 = max(int(cy) - r, 0), min(int(cy) + r + 1, Y)
+            z0, z1 = max(int(cz) - r, 0), min(int(cz) + r + 1, Z)
+            if x0 >= x1 or y0 >= y1 or z0 >= z1:
+                continue
+            q = ((np.arange(x0, x1) - cx)[:, None, None] ** 2
+                 + (np.arange(y0, y1) - cy)[None, :, None] ** 2
+                 + (np.arange(z0, z1) - cz)[None, None, :] ** 2)
+            np.maximum(vol_np[x0:x1, y0:y1, z0:z1],
+                       amp * np.exp(-0.5 * q / sigma_vox ** 2),
+                       out=vol_np[x0:x1, y0:y1, z0:z1])
+    print(f"[splat_mesh] filament pass: {n_keep} filament clusters recovered "
+          f"({ncand} candidate gaussians, {len(segments)} segments)", flush=True)
+    return torch.as_tensor(vol_np, device=device, dtype=vol_s.dtype), n_keep
+
+
 def splat_to_mesh(xyz, opacity, scale, quat, rgb, *, resolution, device,
                   kernel=5, level_bias=0.4, min_component=500, min_opacity=0.02,
-                  color_sharpen=2.0, taubin=12, scale_floor_frac=0.9, vivid_color=False):
+                  color_sharpen=2.0, taubin=12, scale_floor_frac=0.9, vivid_color=False,
+                  vol_smooth=0.0, vol_smooth_color=None, filaments=True):
     """Full splat -> (verts f32, faces i64, colors f32 0..1, display space). Returns
     None if no surface. All inputs are torch tensors on `device`: xyz (N,3), opacity
     (N,), scale (N,3) linear std, quat (N,4) wxyz, rgb (N,3) display 0..1."""
@@ -241,31 +436,109 @@ def splat_to_mesh(xyz, opacity, scale, quat, rgb, *, resolution, device,
     # grid fragments into thousands of disconnected spikes (the "holes"). Spacing is
     # a property of the cloud (not the grid), so this stays solid at any resolution.
     # Geometry/density only — colour weighting is unaffected.
-    if scale_floor_frac > 0 and xyz.shape[0] > 8:
+    spacing = 0.0
+    if xyz.shape[0] > 8:
         xn = xyz.detach().cpu().numpy()
         sub = xn[np.random.default_rng(0).choice(len(xn), min(20000, len(xn)), replace=False)]
         spacing = float(np.median(cKDTree(xn).query(sub, k=2)[0][:, 1]))
-        scale = torch.clamp(scale, min=spacing * scale_floor_frac)
+        if scale_floor_frac > 0:
+            scale = torch.clamp(scale, min=spacing * scale_floor_frac)
 
     vol, colvol, colnorm, origin, voxel = _splat_density(
         xyz, opacity, scale, quat, rgb, resolution, kernel, device, color_sharpen=color_sharpen)
+
+    # Crevasse suppression: the density dips between neighbouring gaussians at
+    # ~1-voxel wavelength (inter-gaussian spacing ≈ voxel size at res 224), so the
+    # iso-surface carries high-frequency valleys. A ~1-voxel blur of the density
+    # grid removes them at the source; the level is re-estimated on the blurred
+    # volume below. The colour volume gets the SAME blur: the smoothed surface
+    # sits up to ~half a voxel off the raw one, where the unblurred colnorm can be
+    # near-zero — sampling num/den there produces ring/moire colour artifacts.
+    # vol_smooth_color: colour-volume blur sigma; defaults to the geometry sigma.
+    # The colour blur must stay > 0 (the smoothed surface sits where the raw
+    # colnorm can be ~0 → ring/moire artifacts) but can be SMALLER than the
+    # geometry blur to keep texture detail (wood grain, plank seams) crisper.
+    #
+    # ADAPTIVE SIGMA (upward only): at the default config the gaussian spacing is
+    # SUB-voxel (spacing/voxel ≈ 0.4 at 262k @ res 224) and the crevasses are
+    # voxel-scale noise — the calibrated vol_smooth handles them. When the cloud
+    # is sparse relative to the grid (low gaussian counts, Ultra resolution), the
+    # inter-gaussian valleys span spacing/voxel voxels and a fixed sigma would
+    # leave them in → scale UP with the ratio. Never scale below the validated
+    # default; cap at 2.5x so extreme clouds cannot melt features.
+    if vol_smooth > 0:
+        ratio = (spacing / voxel) if (spacing > 0 and voxel > 0) else 0.4
+        mult = min(max(ratio / 0.9, 1.0), 2.5)
+        s = float(vol_smooth) * mult
+        sc = s if vol_smooth_color is None else float(vol_smooth_color) * mult
+        if mult != 1.0:
+            print(f"[splat_mesh] vol_smooth adaptive: spacing/voxel={ratio:.2f} "
+                  f"-> sigma {s:.2f} (x{mult:.2f})", flush=True)
+        vol = _gaussian_blur3d(vol, s)
+        if sc > 0:
+            colnorm = _gaussian_blur3d(colnorm.float(), sc)
+            colvol = torch.stack([_gaussian_blur3d(colvol[..., ch].float(), sc)
+                                  for ch in range(3)], dim=-1)
+
     colvol_np = colvol.float().cpu().numpy()
     colnorm_np = colnorm.float().cpu().numpy()
+    # Nearest-valid colour dilation (same fix as tsdf._sample_colors_dilated):
+    # vertices can land where the co-splatted colour volume is near-empty
+    # (blind spots, filament-stamped tubes) — raw num/den there yields the dark
+    # speckles / ring artifacts seen on Standard-mode cheeks. One EDT fills
+    # every invalid voxel with its nearest valid colour before sampling.
+    _valid = colnorm_np > max(1e-6, 1e-4 * float(colnorm_np.max()))
+    if not _valid.all() and _valid.any():
+        from scipy.ndimage import distance_transform_edt as _edt
+        _ind = _edt(~_valid, return_distances=False, return_indices=True)
+        colvol_np = colvol_np[_ind[0], _ind[1], _ind[2]]
+        colnorm_np = colnorm_np[_ind[0], _ind[1], _ind[2]]
+        del _ind
     del colvol, colnorm
 
     vmin, vmax = float(vol.min()), float(vol.max())
     occ = vol[vol > vmax * 1e-3]
     if occ.numel() == 0:
         return None
-    level = min(max(_otsu_level(occ.cpu().numpy()) * level_bias, vmin + 1e-6 * (vmax - vmin)),
-                vmax - 1e-6 * (vmax - vmin))
+    otsu = _otsu_level(occ.cpu().numpy())
 
-    verts, faces = _surface_nets(vol, level, voxel, origin, device)
+    # Filament (whisker) recovery: stamp detected sub-voxel filament chains back
+    # into the density volume before extraction. No-op when nothing is detected.
+    if filaments:
+        vol, _nfil = _filament_stamp(vol, otsu * level_bias, xyz, origin, voxel, device)
+
+    # Connectivity-driven level selection. A single global level fragments splats
+    # whose surface density is locally weak (sparser / lower-opacity patches —
+    # the same Otsu-based level that extracts one object cleanly shreds another
+    # with near-identical global stats). If the largest connected component holds
+    # < 90% of the faces, retry with a lower level; keep the best attempt.
+    # Healthy objects accept the first try — zero extra cost.
+    best = None
+    best_ratio = -1.0
+    for lb_mult in (1.0, 0.7, 0.5):
+        level = min(max(otsu * level_bias * lb_mult, vmin + 1e-6 * (vmax - vmin)),
+                    vmax - 1e-6 * (vmax - vmin))
+        v_try, f_try = _surface_nets(vol, level, voxel, origin, device)
+        if min_component > 0 and len(f_try) > 0:
+            v_try, f_try = _clean_components(v_try, f_try, min_component)
+        if len(v_try) == 0 or len(f_try) == 0:
+            continue
+        e = np.concatenate([f_try[:, [0, 1]], f_try[:, [1, 2]], f_try[:, [0, 2]]], 0)
+        ncomp, label = connected_components(
+            coo_matrix((np.ones(len(e)), (e[:, 0], e[:, 1])),
+                       shape=(len(v_try), len(v_try))), directed=False)
+        fcount = np.bincount(label[f_try[:, 0]], minlength=ncomp)
+        ratio = float(fcount.max()) / max(len(f_try), 1)
+        if ratio > best_ratio:
+            best, best_ratio = (v_try, f_try), ratio
+        if ratio >= 0.90:
+            break
+        print(f"[splat_mesh] fragmented at level_bias {level_bias * lb_mult:.2f} "
+              f"(main component {ratio * 100:.0f}%) — lowering level", flush=True)
     del vol
-    if min_component > 0 and len(faces) > 0:
-        verts, faces = _clean_components(verts, faces, min_component)
-    if len(verts) == 0 or len(faces) == 0:
+    if best is None:
         return None
+    verts, faces = best
 
     verts = _taubin_smooth(verts, faces, taubin)
 
