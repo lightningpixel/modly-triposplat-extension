@@ -47,7 +47,7 @@ in this image-to-3D path, so kept off the UI).
 
 Pure PyTorch — **no compiled CUDA extensions**. `setup.py` creates an isolated
 venv with an accelerator-matched PyTorch build, plus `numpy safetensors pillow
-tqdm huggingface_hub trimesh pymeshlab scipy`. The model code (`triposplat.py`,
+tqdm huggingface_hub trimesh pymeshlab scipy xatlas`. The model code (`triposplat.py`,
 `model.py`) is pure Python and bundled in `vendor/`.
 
 - **Weights:** `VAST-AI/TripoSplat` (~3.8 GB), auto-downloaded on first run.
@@ -60,3 +60,19 @@ python build_vendor.py   # refresh vendor/ (triposplat.py + model.py) from the S
 ```
 
 Commit `vendor/` so end users never fetch source at runtime.
+
+## License
+
+This extension's own code is released under the [MIT License](LICENSE) © 2026 Lorchie.
+
+### Third-party licenses
+
+The extension downloads and runs third-party models at install/run time, each
+under its own license:
+
+| Component | Source | License |
+|-----------|--------|---------|
+| TripoSplat model & code (`triposplat.py`, `model.py`, weights) | [VAST-AI/TripoSplat](https://huggingface.co/VAST-AI/TripoSplat) (Tripo AI / VAST AI Research) | MIT |
+
+The MIT license above covers only this extension's code; bundled/downloaded
+models remain under the licenses listed here.

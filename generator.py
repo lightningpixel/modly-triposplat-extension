@@ -118,8 +118,6 @@ class TripoSplatGenerator(BaseGenerator):
         color_refine   = color_mode == "Refined"
         taubin         = _RECON_SMOOTHING.get(str(params.get("mesh_smoothing", "Medium")), 12)
         tex_res          = _TEX_RES.get(str(params.get("texture", "Vertex colors")), None)
-        geometry_preset  = str(params.get("geometry", "Standard"))
-        fill_mode        = str(params.get("fill_holes", "On"))
         seed           = int(params.get("seed", -1))
 
         # Fixed pipeline values (not user-tunable — kept off the UI as they had no
@@ -158,8 +156,8 @@ class TripoSplatGenerator(BaseGenerator):
             return self._export_splat(gaussian, progress_cb)
 
         self._report(progress_cb, 72, "Reconstructing mesh…")
-        mesh = self._reconstruct(gaussian, mesh_detail, vivid_color, taubin, fill_mode,
-                                 tex_res, geometry_preset, color_refine=color_refine)
+        mesh = self._reconstruct(gaussian, mesh_detail, vivid_color, taubin,
+                                 tex_res, color_refine=color_refine)
         self._check_cancelled(cancel_event)
 
         ref_pts    = getattr(self, "_bench_ref_pts", None)
@@ -338,8 +336,7 @@ class TripoSplatGenerator(BaseGenerator):
     _RES = {7: 160, 8: 192, 9: 224, 10: 288}
 
     def _reconstruct(self, gaussian, mesh_detail: int, vivid_color: bool = False, taubin: int = 6,
-                     fill_mode: str = "On", tex_res=None, geometry_preset: str = "Standard",
-                     color_refine: bool = False):
+                     tex_res=None, color_refine: bool = False):
         """Gaussian splat -> vertex-colored mesh via the ported ComfyUI SplatToMesh
         (anisotropic density grid + Surface Nets). Falls back to CPU on CUDA OOM."""
         # Texture "Auto": run the vertex path with refined colours, build the
@@ -403,10 +400,7 @@ class TripoSplatGenerator(BaseGenerator):
         verts, faces, colors = out
 
         if len(faces) > 0:
-            if fill_mode == "Solid":
-                verts, faces, colors = self._solidify(verts, faces, colors, res)
-            elif fill_mode != "Off":
-                verts, faces, colors = self._close_holes(verts, faces, colors)
+            verts, faces, colors = self._close_holes(verts, faces, colors)
 
         # Vertex budget: the geomean voxel grid hands elongated objects their full
         # res^3 budget, which at Ultra can mean 1.8-2.6M faces — every downstream
@@ -440,25 +434,6 @@ class TripoSplatGenerator(BaseGenerator):
                                        np.asarray(colors, np.float32).copy())
             except Exception as _exc:
                 print(f"[TripoSplatGenerator] ref_pts sampling skipped: {_exc}", flush=True)
-
-        # SplatForge geometry refinement — opt-in; Standard path is byte-identical.
-        if geometry_preset not in (None, "Standard") and len(faces) > 0:
-            try:
-                if str(_EXTENSION_DIR) not in sys.path:
-                    sys.path.insert(0, str(_EXTENSION_DIR))
-                from splatforge import refine as _sf_refine
-                keep = opacity >= 0.02
-                g_sf = {"xyz": xyz[keep], "opacity": opacity[keep], "scale": scale[keep],
-                        "quat": quat[keep], "rgb": rgb[keep]}
-                print(f"[TripoSplatGenerator] SplatForge {geometry_preset} …", flush=True)
-                verts_r, faces_r = _sf_refine(verts, faces, g_sf, preset=geometry_preset, device=dev)
-                from scipy.spatial import cKDTree
-                _, idx = cKDTree(verts).query(verts_r, k=1)
-                colors = colors[idx]
-                verts, faces = verts_r, faces_r
-            except Exception as exc:
-                print(f"[TripoSplatGenerator] splatforge.refine failed ({exc}); "
-                      f"using Standard geometry.", flush=True)
 
         # DepthFit (quality modes): depth-supervised linearized geometry refinement —
         # vertices move along their normals so the rasterized depth matches the
@@ -709,34 +684,6 @@ class TripoSplatGenerator(BaseGenerator):
         m = ms.current_mesh()
         v2 = m.vertex_matrix().astype(np.float32)
         f2 = m.face_matrix().astype(np.int64)
-        _, idx = cKDTree(verts).query(v2, k=1)
-        return v2, f2, colors[idx]
-
-    @staticmethod
-    def _solidify(verts, faces, colors, resolution):
-        """Guaranteed-watertight 'nuclear' fill: voxelize the mesh, flood-fill the
-        interior to a solid, and re-extract a closed surface (marching cubes). Removes
-        every hole AND the hollow interior, at the cost of some fine detail. The voxel
-        grid is mapped back to world space (`vg.transform`), a light Taubin pass removes
-        the staircase, and colors are re-mapped by nearest original vertex. Falls back to
-        hole-capping if voxelization fails."""
-        import trimesh
-        from scipy.spatial import cKDTree
-        try:
-            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-            diag = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
-            pitch = diag / float(min(int(resolution), 256))
-            vg = mesh.voxelized(pitch=pitch).fill()
-            out = vg.marching_cubes
-            out.apply_transform(vg.transform)
-            out.update_faces(out.unique_faces())
-            out.remove_unreferenced_vertices()
-            trimesh.smoothing.filter_taubin(out, iterations=10)
-            v2 = out.vertices.astype(np.float32)
-            f2 = out.faces.astype(np.int64)
-        except Exception as exc:
-            print(f"[TripoSplatGenerator] solidify failed ({exc}); falling back to hole-cap.")
-            return TripoSplatGenerator._close_holes(verts, faces, colors)
         _, idx = cKDTree(verts).query(v2, k=1)
         return v2, f2, colors[idx]
 
