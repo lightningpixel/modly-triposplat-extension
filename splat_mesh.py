@@ -54,7 +54,13 @@ def _splat_density(xyz, opacity, scale, quat, rgb, res, kernel, device,
     # ~res^3 for ANY aspect ratio; cube-ish objects are unchanged. Refinement
     # capped at 2x so needle-like objects cannot stretch one axis absurdly.
     ext = (hi - lo).clamp_min(1e-8)
-    voxel = (ext.prod().pow(1.0 / 3.0) / res).clamp(min=ext.max() / (2.0 * res))
+    # Reduce the 3 extents to the scalar voxel size on the HOST in plain Python.
+    # Doing `ext.prod().pow(1/3)` on a CUDA tensor JIT-fuses an nvrtc kernel that
+    # fails on some GPU archs (Jetson/arm64: "nvrtc: error: invalid value for
+    # --gpu-architecture"). It's only 3 floats, so host-side math is free and
+    # numerically identical: max(geomean/res, max_extent/(2*res)) == the old clamp.
+    ex, ey, ez = ext.tolist()
+    voxel = max((ex * ey * ez) ** (1.0 / 3.0) / res, max(ex, ey, ez) / (2.0 * res))
     dx, dy, dz = (torch.ceil(ext / voxel).long() + 1).tolist()
 
     sinv = _inverse_covariance(scale, quat)

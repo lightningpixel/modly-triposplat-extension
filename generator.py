@@ -117,7 +117,7 @@ class TripoSplatGenerator(BaseGenerator):
         vivid_color    = color_mode == "Vivid"
         color_refine   = color_mode == "Refined"
         taubin         = _RECON_SMOOTHING.get(str(params.get("mesh_smoothing", "Medium")), 12)
-        tex_res          = _TEX_RES.get(str(params.get("texture", "Vertex colors")), None)
+        tex_res        = _TEX_RES.get(str(params.get("texture", "Vertex colors")), None)
         seed           = int(params.get("seed", -1))
 
         # Fixed pipeline values (not user-tunable — kept off the UI as they had no
@@ -371,19 +371,23 @@ class TripoSplatGenerator(BaseGenerator):
         # masked TSDF fusion. Gate 4/4: +0.9 dB on a shredded splat, crater on
         # the back of heads fixed, BIT-IDENTICAL no-op on defect-free objects.
         def _run(d):
-            if color_refine or tex_auto:
-                try:
-                    if str(_EXTENSION_DIR) not in sys.path:
-                        sys.path.insert(0, str(_EXTENSION_DIR))
-                    from splatforge.tsdf import splat_to_mesh_repair
-                    out = splat_to_mesh_repair(
-                        xyz.to(d), opacity.to(d), scale.to(d), quat.to(d),
-                        rgb.to(d), resolution=res, device=d, taubin=taubin)
-                    if out is not None:
-                        return out[0], out[1], out[2]
-                except Exception as exc:
-                    print(f"[TripoSplatGenerator] repair extraction failed ({exc}); "
-                          f"using standard extraction.", flush=True)
+            # The defect-driven repair extraction now runs in EVERY mode (un-gated
+            # 2026-06-20), not just Refined/Auto: it is a bit-identical no-op on
+            # defect-free objects and fixes blind-spot craters (e.g. the cat's
+            # shredded head crown) that the fast Vertex/Natural path otherwise ships
+            # holey. DepthFit + colour-refine stay gated below (cost / hard-edge risk).
+            try:
+                if str(_EXTENSION_DIR) not in sys.path:
+                    sys.path.insert(0, str(_EXTENSION_DIR))
+                from splatforge.tsdf import splat_to_mesh_repair
+                out = splat_to_mesh_repair(
+                    xyz.to(d), opacity.to(d), scale.to(d), quat.to(d),
+                    rgb.to(d), resolution=res, device=d, taubin=taubin)
+                if out is not None:
+                    return out[0], out[1], out[2]
+            except Exception as exc:
+                print(f"[TripoSplatGenerator] repair extraction failed ({exc}); "
+                      f"using standard extraction.", flush=True)
             return splat_to_mesh(xyz.to(d), opacity.to(d), scale.to(d), quat.to(d),
                                  rgb.to(d), resolution=res, device=d,
                                  vivid_color=vivid_color, taubin=taubin,
