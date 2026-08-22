@@ -122,6 +122,18 @@ def setup(
     # hard-imports plotly at module load. pymeshlab is a single self-contained
     # wheel (already used elsewhere in Modly) with no such baggage.
     # ------------------------------------------------------------------ #
+    # xatlas 0.0.9 publishes macOS wheels for x86_64 only — on Apple Silicon pip
+    # falls back to the sdist and the CMake/Ninja build fails, taking the whole
+    # install down.  0.0.10+ ship cp3x-macosx_11_0_arm64 wheels and expose the
+    # same Atlas/ChartOptions/PackOptions API unwrap_worker.py uses.  The pin is
+    # left alone elsewhere: 0.0.9 is the version validated against the Windows
+    # segfault threshold documented in texture_bake.py.
+    xatlas_spec = (
+        "xatlas>=0.0.10"
+        if platform.system() == "Darwin" and platform.machine().lower() in ("arm64", "aarch64")
+        else "xatlas==0.0.9"
+    )
+
     print("[setup] Installing core dependencies …")
     pip(venv, "install",
         "numpy",
@@ -132,7 +144,7 @@ def setup(
         "trimesh",
         "pymeshlab",
         "scipy",
-        "xatlas==0.0.9",
+        xatlas_spec,
     )
 
     # ------------------------------------------------------------------ #
