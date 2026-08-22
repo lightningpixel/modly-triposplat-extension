@@ -55,6 +55,57 @@ def fetch_model_code(ext_dir: Path) -> None:
     print("[setup] Model code ready in vendor/.")
 
 
+def dedupe_libomp(venv: Path) -> None:
+    """Point pymeshlab's bundled libomp at torch's so only one copy initialises.
+
+    torch ships torch/lib/libomp.dylib and pymeshlab ships
+    pymeshlab/Frameworks/libomp.dylib. Both get loaded in the same process the
+    first time a pymeshlab plugin that links OpenMP is used — in this extension
+    that is generate_resampled_uniform_mesh, called from _prep_texture_geometry
+    during the texture bake. LLVM's runtime then reports
+
+        OMP: Error #15: Initializing libomp.dylib, but found libomp.dylib
+        already initialized.
+
+    and calls abort(), so the process dies with no Python traceback and Modly
+    reports "Subprocess died during generation". KMP_DUPLICATE_LIB_OK=TRUE is
+    not a fix: it suppresses the check and the same call then segfaults
+    (verified, SIGSEGV) — which is why this replaces the duplicate instead.
+
+    macOS only; the original is kept alongside as libomp.dylib.orig.
+    """
+    if platform.system() != "Darwin":
+        return
+
+    out = subprocess.check_output(
+        [str(python_exe_for(venv)), "-c",
+         "import site; print([p for p in site.getsitepackages() if 'site-packages' in p][0])"],
+        text=True,
+    ).strip()
+    site_packages = Path(out)
+
+    torch_omp = site_packages / "torch" / "lib" / "libomp.dylib"
+    pml_omp   = site_packages / "pymeshlab" / "Frameworks" / "libomp.dylib"
+    if not torch_omp.exists() or not pml_omp.exists():
+        return
+    if pml_omp.is_symlink():
+        print("[setup] libomp already deduped.")
+        return
+
+    backup = pml_omp.with_name("libomp.dylib.orig")
+    if backup.exists():
+        pml_omp.unlink()
+    else:
+        pml_omp.rename(backup)
+    pml_omp.symlink_to(torch_omp)
+    print(f"[setup] Deduped libomp: {pml_omp} -> {torch_omp}")
+
+
+def python_exe_for(venv: Path) -> Path:
+    is_win = platform.system() == "Windows"
+    return venv / ("Scripts/python.exe" if is_win else "bin/python")
+
+
 def setup(
     python_exe:    str,
     ext_dir:       Path,
@@ -150,6 +201,10 @@ def setup(
     # ------------------------------------------------------------------ #
     # Model source code (pure Python, fetched from the official Space)
     # ------------------------------------------------------------------ #
+    # macOS: torch and pymeshlab both ship libomp.dylib; loading both kills the
+    # process during the texture bake. Must run after both are installed.
+    dedupe_libomp(venv)
+
     print("[setup] Fetching TripoSplat model code …")
     fetch_model_code(ext_dir)
 
