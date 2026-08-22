@@ -12,6 +12,7 @@ TripoSplat and extracts a vertex-colored mesh from the Gaussians via splat_mesh.
 The model code (triposplat.py + model.py, pure Python) is bundled in vendor/.
 """
 import io
+import os
 import sys
 import time
 import threading
@@ -24,7 +25,47 @@ from PIL import Image
 
 from services.generators.base import BaseGenerator, GenerationCancelled
 
+# Let any op without an MPS kernel fall back to CPU instead of hard-failing.
+# Must be set before torch initialises its MPS backend, hence module scope
+# (torch itself is imported lazily inside load()).
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 _EXTENSION_DIR = Path(__file__).parent
+
+
+def _pick_device() -> str:
+    """Best available torch device: CUDA, then Apple Silicon MPS, then CPU."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _empty_accel_cache() -> None:
+    """Release cached accelerator memory on whichever backend is active."""
+    import torch
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """True for an out-of-memory error from any backend.
+
+    CUDA raises torch.cuda.OutOfMemoryError; MPS raises a plain RuntimeError
+    ("MPS backend out of memory ..."), so matching on the type alone would let
+    an MPS OOM escape the CPU-retry paths below.
+    """
+    import torch
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 # Mesh Smoothing label -> Taubin iterations applied during reconstruction. Lower keeps
 # crisper relief; the surface stays smooth because Surface Nets already produces a dual
@@ -73,7 +114,7 @@ class TripoSplatGenerator(BaseGenerator):
         import torch
         from triposplat import TripoSplatPipeline
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = _pick_device()
 
         md = self._weights_dir()
         print(f"[TripoSplatGenerator] Loading TripoSplat pipeline from {md} …")
@@ -93,6 +134,9 @@ class TripoSplatGenerator(BaseGenerator):
     def unload(self) -> None:
         self._device = None
         super().unload()
+        # BaseGenerator.unload() only empties the CUDA cache; on a 16 GB unified
+        # -memory Mac the MPS cache is exactly what needs releasing.
+        _empty_accel_cache()
 
     # ------------------------------------------------------------------ #
     # Inference
@@ -394,8 +438,10 @@ class TripoSplatGenerator(BaseGenerator):
                                  vol_smooth=0.7)
         try:
             out = _run(dev)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            _empty_accel_cache()
             cpu = torch.device("cpu")
             out = _run(cpu)
 
@@ -588,8 +634,10 @@ class TripoSplatGenerator(BaseGenerator):
              "quat": quat[keep], "rgb": rgb[keep]}
         try:
             nv, nf, uvs, tex = bake_texture(verts, faces, g, tex_res, dev, vivid_color)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            _empty_accel_cache()
             cpu = torch.device("cpu")
             g = {k: v.to(cpu) for k, v in g.items()}
             nv, nf, uvs, tex = bake_texture(verts, faces, g, tex_res, cpu, vivid_color)
