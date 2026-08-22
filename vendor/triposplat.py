@@ -257,6 +257,10 @@ def _build_gaussians(decoder: ElasticGaussianFixedlenDecoder, points_pred: dict,
             scaling_bias=decoder.rep_config['scaling_bias'],
             opacity_bias=decoder.rep_config['opacity_bias'],
             scaling_activation=decoder.rep_config['scaling_activation'],
+            # Follow the tensors instead of Gaussian's device='cuda' default,
+            # which asserts "Torch not compiled with CUDA enabled" on any
+            # non-CUDA build once decoding starts.
+            device=h.device,
         )
         _x = x["points"][i, :, None, :]
         for k, v in decoder.layout.items():
