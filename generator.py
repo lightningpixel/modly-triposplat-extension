@@ -79,6 +79,41 @@ _RECON_SMOOTHING = {"None": 0, "Light": 6, "Medium": 12, "Strong": 20}
 _TEX_RES = {"Vertex colors": None, "Baked 1K": 1024, "Baked 2K": 2048, "Auto": "auto"}
 
 
+def _is_gaussian_splat_ply(path: str) -> bool:
+    """True for a 3DGS point-cloud .ply: splat properties and no face element."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(2048).split(b"end_header", 1)[0].decode("ascii", "replace")
+    except Exception:
+        return False
+    return ("element face" not in head
+            and all(k in head for k in ("f_dc_0", "opacity", "scale_0", "rot_0")))
+
+
+def _bad_mesh_message(mesh_path: str) -> str:
+    """Explain why the Projection node could not use this input.
+
+    The common case is a Create Splat output wired straight into Projection.
+    Both nodes declare output/input type "mesh" in manifest.json — Modly has no
+    separate splat type — so the canvas allows the connection even though Create
+    Splat emits a Gaussian point cloud with no faces, and Projection needs a
+    triangle surface to paint.
+    """
+    if _is_gaussian_splat_ply(mesh_path):
+        return (
+            f"{Path(mesh_path).name} is a Gaussian splat point cloud, not a mesh — "
+            "it has per-splat properties (f_dc, opacity, scale, rot) and no faces, "
+            "so there is no surface to project colour onto.\n"
+            "The Create Splat node outputs this. Wire the TripoSplat (Mesh) node or "
+            "a Load 3D Mesh node into Projection's mesh input instead; Create Splat "
+            "and Projection cannot be chained."
+        )
+    return (
+        f"Could not load a valid mesh from: {mesh_path}\n"
+        "Projection needs a file with triangle faces (.glb/.obj/.ply with faces)."
+    )
+
+
 class TripoSplatGenerator(BaseGenerator):
     MODEL_ID     = "triposplat"
     DISPLAY_NAME = "TripoSplat"
@@ -255,7 +290,7 @@ class TripoSplatGenerator(BaseGenerator):
         self._report(progress_cb, 3, "Loading mesh…")
         grey = trimesh.load(mesh_path, force="mesh")
         if not isinstance(grey, trimesh.Trimesh) or len(grey.vertices) == 0:
-            raise ValueError(f"Could not load a valid mesh from: {mesh_path}")
+            raise ValueError(_bad_mesh_message(mesh_path))
 
         pipe  = self._model
         image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
