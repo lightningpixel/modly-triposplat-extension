@@ -12,6 +12,7 @@ TripoSplat and extracts a vertex-colored mesh from the Gaussians via splat_mesh.
 The model code (triposplat.py + model.py, pure Python) is bundled in vendor/.
 """
 import io
+import os
 import sys
 import time
 import threading
@@ -24,7 +25,47 @@ from PIL import Image
 
 from services.generators.base import BaseGenerator, GenerationCancelled
 
+# Let any op without an MPS kernel fall back to CPU instead of hard-failing.
+# Must be set before torch initialises its MPS backend, hence module scope
+# (torch itself is imported lazily inside load()).
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 _EXTENSION_DIR = Path(__file__).parent
+
+
+def _pick_device() -> str:
+    """Best available torch device: CUDA, then Apple Silicon MPS, then CPU."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _empty_accel_cache() -> None:
+    """Release cached accelerator memory on whichever backend is active."""
+    import torch
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        elif torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+    except Exception:
+        pass
+
+
+def _is_oom(exc: BaseException) -> bool:
+    """True for an out-of-memory error from any backend.
+
+    CUDA raises torch.cuda.OutOfMemoryError; MPS raises a plain RuntimeError
+    ("MPS backend out of memory ..."), so matching on the type alone would let
+    an MPS OOM escape the CPU-retry paths below.
+    """
+    import torch
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
 
 # Mesh Smoothing label -> Taubin iterations applied during reconstruction. Lower keeps
 # crisper relief; the surface stays smooth because Surface Nets already produces a dual
@@ -36,6 +77,41 @@ _RECON_SMOOTHING = {"None": 0, "Light": 6, "Medium": 12, "Strong": 20}
 # mini-gate (4 held-out views, SSAA, SSIM decides) — no geometric heuristic
 # separates the cases reliably (measured), only the empirical comparison does.
 _TEX_RES = {"Vertex colors": None, "Baked 1K": 1024, "Baked 2K": 2048, "Auto": "auto"}
+
+
+def _is_gaussian_splat_ply(path: str) -> bool:
+    """True for a 3DGS point-cloud .ply: splat properties and no face element."""
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(2048).split(b"end_header", 1)[0].decode("ascii", "replace")
+    except Exception:
+        return False
+    return ("element face" not in head
+            and all(k in head for k in ("f_dc_0", "opacity", "scale_0", "rot_0")))
+
+
+def _bad_mesh_message(mesh_path: str) -> str:
+    """Explain why the Projection node could not use this input.
+
+    The common case is a Create Splat output wired straight into Projection.
+    Both nodes declare output/input type "mesh" in manifest.json — Modly has no
+    separate splat type — so the canvas allows the connection even though Create
+    Splat emits a Gaussian point cloud with no faces, and Projection needs a
+    triangle surface to paint.
+    """
+    if _is_gaussian_splat_ply(mesh_path):
+        return (
+            f"{Path(mesh_path).name} is a Gaussian splat point cloud, not a mesh — "
+            "it has per-splat properties (f_dc, opacity, scale, rot) and no faces, "
+            "so there is no surface to project colour onto.\n"
+            "The Create Splat node outputs this. Wire the TripoSplat (Mesh) node or "
+            "a Load 3D Mesh node into Projection's mesh input instead; Create Splat "
+            "and Projection cannot be chained."
+        )
+    return (
+        f"Could not load a valid mesh from: {mesh_path}\n"
+        "Projection needs a file with triangle faces (.glb/.obj/.ply with faces)."
+    )
 
 
 class TripoSplatGenerator(BaseGenerator):
@@ -73,7 +149,7 @@ class TripoSplatGenerator(BaseGenerator):
         import torch
         from triposplat import TripoSplatPipeline
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = _pick_device()
 
         md = self._weights_dir()
         print(f"[TripoSplatGenerator] Loading TripoSplat pipeline from {md} …")
@@ -93,6 +169,9 @@ class TripoSplatGenerator(BaseGenerator):
     def unload(self) -> None:
         self._device = None
         super().unload()
+        # BaseGenerator.unload() only empties the CUDA cache; on a 16 GB unified
+        # -memory Mac the MPS cache is exactly what needs releasing.
+        _empty_accel_cache()
 
     # ------------------------------------------------------------------ #
     # Inference
@@ -211,7 +290,7 @@ class TripoSplatGenerator(BaseGenerator):
         self._report(progress_cb, 3, "Loading mesh…")
         grey = trimesh.load(mesh_path, force="mesh")
         if not isinstance(grey, trimesh.Trimesh) or len(grey.vertices) == 0:
-            raise ValueError(f"Could not load a valid mesh from: {mesh_path}")
+            raise ValueError(_bad_mesh_message(mesh_path))
 
         pipe  = self._model
         image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
@@ -394,8 +473,10 @@ class TripoSplatGenerator(BaseGenerator):
                                  vol_smooth=0.7)
         try:
             out = _run(dev)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            _empty_accel_cache()
             cpu = torch.device("cpu")
             out = _run(cpu)
 
@@ -588,8 +669,10 @@ class TripoSplatGenerator(BaseGenerator):
              "quat": quat[keep], "rgb": rgb[keep]}
         try:
             nv, nf, uvs, tex = bake_texture(verts, faces, g, tex_res, dev, vivid_color)
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
+        except Exception as exc:
+            if not _is_oom(exc):
+                raise
+            _empty_accel_cache()
             cpu = torch.device("cpu")
             g = {k: v.to(cpu) for k, v in g.items()}
             nv, nf, uvs, tex = bake_texture(verts, faces, g, tex_res, cpu, vivid_color)
